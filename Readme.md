@@ -95,4 +95,4 @@ Normal use requires no online service or model downloads. The controller itself 
 
 `main.py` coordinates startup and processing; `gestures.py` handles playback gestures; `activation.py` handles activation and hand identity; `pipeline.py` handles capture/inference; `vlc_control.py` delivers VLC commands; `lifecycle.py` and `stop_controller.py` manage the instance and shutdown.
 
-The virtual environment, logs and downloaded models are excluded from Git. For historical implementation detail, see [Development Notes](DEVELOPMENT_NOTES.md).
+The virtual environment, logs and downloaded models are excluded from Git. For historical implementation detail, see [Development Notes](Development_Notes.md).
