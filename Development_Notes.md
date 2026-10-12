@@ -1,248 +1,191 @@
 # VLC Gesture Controller — Development Notes
 
-Archived implementation and manual-testing notes from development. Some passages describe earlier settings or superseded behavior. For current setup and usage, see [README.md](README.md); configuration defaults live in [config.py](config.py).
+## File map
 
-Windows 11, Python 3.14 (standard 64-bit build), one webcam, existing VLC.
-No preview window. All inference uses a local model; no application network calls.
+| File                                     | Responsibility                                                                                                                                         |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [main.py](main.py)                       | Startup logging and retention, configuration validation, camera/model lifecycle, main processing loop, command authorization, diagnostics and preview. |
+| [config.py](config.py)                   | Centralized camera settings, gesture thresholds, timing, movement modes, sounds and fallback keys.                                                     |
+| [activation.py](activation.py)           | Stable left/right hand assignment, left-index HOLD, both-hand Shaka toggle, authorization and audio cues.                                              |
+| [gestures.py](gestures.py)               | Right-hand pose classification, confirmation, movement accumulation, play/pause locking and navigation rearming. No camera or Windows dependencies.    |
+| [pipeline.py](pipeline.py)               | Capture worker with a latest-frame slot; single-flight MediaPipe LIVE_STREAM submission and callback/result transfer.                                  |
+| [vlc_control.py](vlc_control.py)         | Foreground VLC identification, keyboard input, targeted volume-wheel messages and dispatch logging.                                                    |
+| [lifecycle.py](lifecycle.py)             | Project/session-scoped Windows mutex and shutdown/completion events.                                                                                   |
+| [stop_controller.py](stop_controller.py) | Lightweight shutdown entry point; imports no camera or MediaPipe code.                                                                                 |
+| [Set Up.bat](Set%20Up.bat)               | Confirmed first-time setup: local Python 3.14 environment, dependencies and model download.                                                            |
+| [Run.bat](Run.bat)                       | Delegates background startup to the VBScript launcher.                                                                                                 |
+| [Run-Hidden.vbs](Run-Hidden.vbs)         | Starts local `pythonw.exe` invisibly with the project as its working directory.                                                                        |
+| [Run-Test.bat](Run-Test.bat)             | Visible console launch with a Y/N preview prompt and exit-code reporting.                                                                              |
+| [Stop.bat](Stop.bat)                     | Runs the lightweight stop helper using the local environment.                                                                                          |
+| [requirements.txt](requirements.txt)     | MediaPipe/OpenCV dependency constraints.                                                                                                               |
+| [.gitignore](.gitignore)                 | Excludes the environment, Python caches, logs, model files and incomplete model downloads.                                                             |
+| [README.md](README.md)                   | User-facing setup, controls and troubleshooting.                                                                                                       |
+| `DEVELOPMENT_NOTES.md`                   | Implementation reference and manual-verification checklist.                                                                                            |
 
-## Setup
+These notes describe the current implementation. Configuration defaults are defined in `config.py`; everyday instructions belong in the README.
 
-Install Python 3.14 first, then double-click **Set Up.bat** and press **Y**
-at the first-time setup prompt. It creates `.venv` inside this project folder,
-installs dependencies and downloads the hand model. Pressing **N** cancels.
-Errors remain visible in the console. If retrying after a failed setup, press Y;
-an existing Python 3.14 environment and completed model download are reused.
+## Processing flow and ownership
 
-Alternatively, run these commands in PowerShell in this folder:
-
-```powershell
-py -3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
-Invoke-WebRequest -Uri 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task' -OutFile 'models\hand_landmarker.task'
+```text
+Camera → latest frame → MediaPipe → safe hand identities
+       → activation → right-hand gesture → foreground check → VLC command
 ```
 
-Setup needs internet. Normal operation needs neither a connection nor downloads.
-MediaPipe 1.1.0 lists Python 3.14 and Windows x64 wheels on [PyPI](https://pypi.org/project/mediapipe/).
-Uses the [Tasks Hand Landmarker VIDEO/LIVE_STREAM API](https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker/python).
+| Owner              | Work                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------- |
+| Main thread        | Hand identity, activation, gesture state, dispatch, diagnostics and preview.           |
+| Capture worker     | Camera reads and camera release after initial configuration.                           |
+| MediaPipe callback | Transfers the completed result under a lock; never updates gestures or sends commands. |
+| Audio thread       | Plays a short beep sequence only when persistent activation toggles.                   |
 
-Double-click **Run.bat** for background control, or **Run-Hidden.vbs** for startup
-without a terminal flash. Both use the local pythonw.exe. **Stop.bat** requests
-graceful shutdown and webcam release. Only one instance per project/login session
-is allowed through every launcher, using a Windows named mutex before heavy imports.
-Startup/shutdown logs include PID; Task Manager's Details > Command line shows
-the project main.py path. Stop uses a lightweight named-event helper and waits up
-to 10 seconds for resource cleanup/log flushing, without terminating processes.
-If it reports pending shutdown, inspect the controller log; blocked driver calls
-must return before cleanup can finish. Windows closes the lock handle on a crash.
-The instance restriction includes preview. **Run-Test.bat** retains the visible console and
-Y/N debug-preview prompt; stop the background instance before using preview.
-The console remains open
-and each execution creates a flushed timestamped file in `logs/`. To stop, focus
-the console and press Ctrl+C. Windows may also ask whether to terminate the batch.
-The launcher does not install anything automatically.
+### Modes and buffering
 
-## Controls and configuration
+- `PROCESSING_MODE = "auto"` selects threaded LIVE_STREAM at eight or more logical CPUs; otherwise it uses synchronous VIDEO mode. The CPU threshold is a heuristic.
+- Explicit `"threaded"` and `"single"` modes support hardware comparison. Thread/model initialization failures fall back to VIDEO where handled.
+- Capture keeps one replaceable latest-frame slot. Inference permits only one outstanding submission/result; there is no unbounded frame queue.
+- Timestamps increase strictly. Frame references are retained rather than repeatedly copying full capture images.
+- Camera disconnection, callback failure or inference timeout stops processing for inspection rather than silently restarting hardware.
 
-Keyboard shortcuts now use foreground-checked Windows SendInput in one ordered batch,
-including Shift-down/key-down/key-up/Shift-up for seeks and chapters. Input structure
-sizes include the complete Win32 union and pointer-sized fields. Held user keys/modifiers
-suppress injection; partial acceptance attempts matching key-up cleanup and logs errors.
-Logs report Windows acceptance, not proof of VLC execution. SendInput is foreground
-input, not window-targeted: a focus change during delivery cannot be atomically excluded.
-Use the same privilege level for VLC/controller and verify Alt+Tab behavior manually.
+### Camera and result freshness
 
-Right-hand navigation: three extended fingers (index/middle/ring), pinky folded,
-then sideways tilt for **Shift+N / Shift+P** chapter next/previous. Chapters track
-average tips 8/12/16 relative to wrist 0, normalized by frozen starting palm size;
-trigger is 0.23 palm widths. Closed fist (thumb ignored) uses smoothed wrist-0 travel
-for **N / P** video next/previous, with a 0.80 palm-width horizontal threshold.
-Horizontal dominance of 1.2 allows curved elbow-pivot sweeps; no elbow model is used.
-Video pose confirmation remains 0.35 seconds and retains movement begun during it.
+| Setting          | Default / meaning                                                                                                     |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Capture          | 640×480, requested 30 FPS; driver-reported mode is logged.                                                            |
+| Inference bounds | 640×360, preserving aspect ratio without upscaling. At 640×480 capture this produces 480×360 inference images.        |
+| Result age limit | 0.12 seconds from camera-read completion; checked during consumption and again before dispatch in threaded mode.      |
+| Focus loss       | Invalidates the session, clears activation/gesture identities and releases the webcam. The model remains initialized. |
+| Preview          | Displays the frame associated with the inference result, with all VLC commands disabled.                              |
 
-Navigation follows ARMED -> RETURNING -> ARMED. After one command, return movement
-never issues the opposite command. The original neutral position remains fixed;
-settle within 0.08 palms (chapter) or 0.22 palms (video) for 0.18 seconds to rearm.
-Rearm also checks low movement speed (0.45 palms/second) against jitter. Holding the
-far endpoint does not repeat commands. Releasing/changing pose establishes a new
-reference on reconfirmation. Short pose glitches preserve state; reacquisition skips
-the current frame, retaining small displacement changes but requiring neutral after
-a large jump. RETURNING survives missing identity so reacquisition cannot trigger
-a reverse command. Genuine pose release, disabled activation or focus loss resets it.
-Cooldowns are 0.25/0.35 seconds, without an additional delay after a settled return.
-Tune `CHAPTER_*`, `VIDEO_*` and `NAVIGATION_*` for manual sensitivity/rearm checks.
-Moving substantially toward/away from the camera or rotating the hand in depth can
-affect these 2D measurements; verify comfortable neutral positions and sweep arcs.
+Generation invalidation prevents old callbacks from reactivating a new camera session. An in-flight marker remains until its callback arrives, avoiding overlapping submissions after invalidation.
 
-Persistent toggle now requires **both hands displaying relaxed Shaka for 0.50 seconds**.
-One Shaka alone cannot toggle. Both candidates and the post-toggle latch suppress
-playback; both hands must visibly release Shaka for 0.20 seconds before resuming.
-Missing/ambiguous hands do not count as release. Left-index HOLD and toggle sounds
-are unchanged. Verify only one toggle while held and no navigation during Shaka.
+## Hand identity and activation
 
-The intended seek is now **one 3-second jump per increment** using simultaneous
-Shift+Left/Right. Your physical-key test confirms VLC's current very-short interval
-is already 3 seconds; no preference changes are needed. If changed previously, set VLC's
-Very short jump length back to 3 manually. Check one Windows-accepted log event
-against one actual jump; no compensating reverse seeks or extra arrow events are used.
+### Identity routing
 
-Confirmed HOLD now tolerates 0.28 seconds of uncertain left pose/identity; commands
-remain paused until the current activation hand is safe. A clear alternate pose
-confirms release in 0.06 seconds. Reacquisition within grace retains HOLD without
-new activation confirmation or right-state resets. Confirmed volume tolerates
-0.18 seconds of right-pose uncertainty; recovery rebases movement and retains its
-accumulator. Tune `LEFT_DEACTIVATION_GRACE_SECONDS`, `LEFT_CLEAR_RELEASE_SECONDS`
-and `VOLUME_POSE_LOSS_SECONDS`. Initial activation, sensitivities and pipeline remain
-unchanged. Logs distinguish temporary pauses/recovery from confirmed release.
+- Initial assignment uses MediaPipe handedness confidence and a short confirmation period, not screen side or detection order.
+- Established identities match previous wrist and middle-knuckle positions. Unique spatial continuity can preserve roles through conflicting labels.
+- Recent identities survive up to 0.22 seconds of loss. Ambiguous matches pause affected hands; stale landmarks are never returned as current evidence.
+- Mirroring correction and `SWAP_HANDEDNESS` are separate. The current swap default reflects manual testing on the original camera.
 
-`PROCESSING_MODE` defaults to `"auto"`: eight or more logical CPUs selects a dedicated
-latest-frame capture thread plus MediaPipe LIVE_STREAM; smaller systems use VIDEO.
-`"threaded"` requests the optimized mode; `"single"` selects the synchronous fallback.
-Initialization failures log a traceback and fall back to VIDEO. Camera disconnection,
-callback errors or timeout during operation stop cleanly for inspection instead of
-silently restarting hardware. The CPU threshold is a heuristic; compare both modes.
+### Activation rules
 
-Capture has one replaceable frame slot. Only one inference/result is outstanding,
-with strictly increasing timestamps. Callbacks only transfer results; the main thread
-alone updates identities, activation, gestures and VLC commands. Focus loss invalidates
-the session and stops/releases capture; old results cannot reactivate it. Result age
-is limited by `MAX_RESULT_AGE_SECONDS` (0.12s), checked again before dispatch. No code
-can detect a physical release before a newer frame has been inferred; this age limit
-bounds that uncertainty. Diagnostics show capture/result FPS, replaced frames,
-inference time and approximate capture-return-to-result latency (not sensor exposure).
-Driver-internal buffering can still exist. Debug preview displays the result's own
-frame. Threaded code retains frame references rather than copying full capture frames.
-Shutdown joins the camera worker; a blocked driver read can delay hardware release,
-which is logged rather than releasing the camera concurrently with the read.
+| State / gesture           | Behavior                                                                                                                              |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Left-index HOLD           | Confirms after 0.18 seconds. Uncertain evidence immediately pauses commands while logical HOLD can survive 0.28 seconds.              |
+| Clear alternate left pose | Ends HOLD after 0.06 seconds of confirmation.                                                                                         |
+| Both-hand Shaka           | Confirms after 0.50 seconds and toggles persistent activation. One Shaka cannot toggle.                                               |
+| Shaka candidate / latch   | Suppresses playback. Both hands must visibly release for 0.20 seconds before playback resumes; missing hands do not count as release. |
+| Persistent activation     | Permits right-hand control without the left hand after Shaka release.                                                                 |
+| Focus/window change       | Clears HOLD and persistent activation silently.                                                                                       |
 
-VLC's Very short backward/forward jump hotkeys should remain Shift+Left/Right, with
-Very short jump length at 3 seconds. No preferences are changed automatically.
+Two ascending beeps indicate ON; one lower beep indicates OFF. HOLD and focus resets do not play sounds. Configuration defines the frequencies and durations.
 
-Movement defaults to fingertip-relative articulation: volume uses index tip minus
-its MCP vertically; seek uses the average index/middle tip minus MCP horizontally.
-Both are palm-normalized, smoothed and dead-zone filtered. Set `MOVEMENT_TRACKING`
-to `"palm"` for the previous full-hand movement. Tune `FINGERTIP_VOLUME_STEP` (0.055),
-`FINGERTIP_SEEK_STEP` (0.18), corresponding jitter settings and `FINGERTIP_SMOOTHING`.
-Abrupt bending pauses/rebases movement; slow bending that remains a valid pose can
-still change the fingertip signal, so manually check comfortable finger articulation.
+## Right-hand gesture state
 
-Right-finger extension uses activation/release angle hysteresis. Seeking has priority
-over volume while the middle finger remains extended; volume requires it to be clearly
-folded. Volume/seek switches require a stable 0.12-second target pose, then the existing
-activation confirmation and fresh baseline. Accumulators clear on genuine switches.
-Preview shows detected pose, active state, displacement and confirmation status.
-Shaka uses relaxed thumb/pinky angles, naturally curled finger checks and palm-relative
-reach with separate retention thresholds. Tune `SHAKA_*_ANGLE`/`SHAKA_*_REACH` if needed;
-its both-hand 0.50-second hold and release requirement preserve the existing sounds.
+### Recognition and continuity
 
-Playback uses the **right hand** only. Raise the **left index** for 0.18 seconds for
-temporary activation, or hold **both-hand Shaka** for 0.50 seconds to toggle persistent
-activation. Visibly release both Shakas before resuming playback. Toggle ON works without
-the left hand remaining visible. Hold mode tolerates 0.28 seconds of uncertainty;
-a clearly different valid pose confirms release in 0.06 seconds. Commands
-pause immediately during missing/uncertain activation evidence, even while HOLD is
-retained. Activation changes reset playback
-baselines. Leaving VLC clears both modes silently.
+- Finger extension uses 155° activation / 140° retention hysteresis.
+- Seeking takes priority over volume while the middle finger remains extended. Volume requires a clearly folded middle finger; thumb position is ignored.
+- Switching between movement gestures requires a stable target pose for 0.12 seconds, then its own confirmation and a fresh baseline.
+- Confirmed volume tolerates 0.18 seconds of uncertain pose; other movement gestures use a 0.15-second tolerance. Commands pause during uncertainty.
+- Volume/seek recovery rebases movement, retains accumulated displacement and suppresses the recovery frame. Abrupt fingertip bending also rebases movement.
+- Genuine pose changes clear movement accumulators. Disabled activation and focus loss reset the right-hand state.
 
-Two ascending beeps confirm toggle ON; one lower beep confirms OFF. Built-in winsound
-runs on a short-lived daemon thread only on a toggle change. Frequencies/durations
-and activation thresholds are in config.py. No sound is played for hold or focus reset.
+### Movement signals and defaults
 
-Handedness is assigned from MediaPipe labels, never detection order or screen side.
-Mirroring correction is combined with `SWAP_HANDEDNESS = True` to correct the
-reversed anatomical labels observed on this camera. This does not change preview
-mirroring or movement direction. Uncertain
-or conflicting labels do not discard established identities when wrist/knuckle
-positions give a unique match. Recent identities survive 0.22 seconds of loss;
-ambiguous spatial matches pause only the affected roles. New identities still need
-confident labels and a short stable assignment.
-This reduces accidental reassignment but model errors cannot be ruled out. Verify
-anatomical left/right labels in Run-Test preview using each hand separately before
-normal operation; camera drivers that already mirror frames require particular care.
-Preview shows both hand labels, left pose, activation mode, right gesture and FPS,
-while all VLC commands stay disabled. Two hands may lower processed FPS; compare logs.
+All distances use image coordinates with Y scaled by image aspect ratio. Palm-relative signals are normalized by hand size.
 
-Manual activation checks: right hand alone must do nothing in normal mode; test
-left-index hold/release, Shaka ON with left hand removed, held-Shaka duplicate
-prevention, Shaka OFF, and focus loss while toggled. Returning to VLC must start
-DISABLED without old movement causing a command. Verify each existing right-hand
-control while activated and confirm Stop.bat still releases the camera.
+| Control    | Default signal                                                 | Increment / threshold                          | Confirmation / cooldown     |
+| ---------- | -------------------------------------------------------------- | ---------------------------------------------- | --------------------------- |
+| Volume     | Index tip 8 relative to MCP 5, vertically                      | 0.055 palm widths; jitter 0.010                | 0.10 s / 0.10 s             |
+| Seek       | Mean index/middle tips 8/12 relative to MCPs 5/9, horizontally | 0.18 palm widths; jitter 0.015                 | 0.10 s / 0.30 s             |
+| Chapter    | Mean tips 8/12/16 relative to wrist 0                          | 0.23 starting palm widths                      | 0.20 s / 0.25 s             |
+| Video      | Wrist 0 travel, including curved arm sweeps                    | 0.80 starting palm widths                      | 0.35 s / 0.35 s             |
+| Play/pause | Open palm including thumb                                      | One action, then neutral-pose release required | 0.25 s hold; 0.20 s release |
 
-- Raise only the index finger, folding middle/ring/little fingers; thumb is ignored.
-  Hold briefly, then move up/down for incremental volume.
-  Release to stop. Each step sends one wheel notch; VLC sets the actual volume increment.
-- Extend index/middle and curl ring/little fingers; move horizontally for continuous
-  seek increments. Right forwards, left backwards; no release between increments.
-- Hold an open palm for 0.25 seconds for Space. Return to neutral before another toggle.
+Volume and seeking use bounded cumulative displacement and require new movement to issue commands. They do not drain a command backlog while stationary. Seek direction changes clear the previous direction's remainder.
 
-Keep one hand visible, palm facing the camera. Movement is mirrored by default.
-Settings, thresholds, frame rate, camera index and key codes live in `config.py`.
-Capture defaults to 640x480 at 30 FPS. Set CAMERA_WIDTH/CAMERA_HEIGHT to 1280/720
-in config.py for comparison; fallback remains 640x480. No upscaling is performed.
-Driver-reported resolution/FPS are logged. VIDEO/LIVE_STREAM tracking and the model remain active
-across focus changes; only the webcam is released. Actual throughput depends on hardware.
-Index volume uses 0.10-second confirmation and a fresh knuckle-center baseline.
-Movement accumulates in 0.010 image-height steps with a 0.002 jitter dead zone,
-at most one command per 0.10 seconds; excess backlog is bounded and commands require
-new movement. Releasing the pose clears accumulated displacement. Seeking tracks
-knuckle-center travel in 0.5 palm-width increments with a 0.025 palm-width dead zone
-and 0.30-second cooldown. Direction changes clear the previous direction's remainder.
-Only new movement triggers commands; release clears seek state. Palm release rules remain unchanged.
-These are starting values for manual tuning; reduce FPS if 30 is unsustainable.
-Inference uses a configurable 640x360 bounding box, preserving capture aspect ratio.
-Only preview retains the full-resolution image for display. Diagnostics report capture
-delivery FPS, processed FPS and capture/resize/conversion/landmark timings. Capture
-delivery in single mode is limited by processing; threaded mode measures the capture
-worker separately. Neither measures independent sensor exposure FPS. No unbounded
-application frame queue is added. A one-frame camera buffer is requested,
-but DirectShow may ignore it, so check driver buffering and latency manually.
+`MOVEMENT_TRACKING = "palm"` selects full-hand movement for volume/seek: volume step 0.010 image height (jitter 0.002), seek step 0.5 palm widths (jitter 0.025). This is an alternative to the default fingertip mode, not an additional calculation layered onto it.
 
-Seek uses SendInput Shift+Right/Left; the optional `SEEK_MODE = "keyboard"` fallback
-uses custom **J/L** bindings to VLC's Very short backward/forward jump actions.
-For volume fallback, assign **U** to VLC's Volume up and **D** to Volume down
-in VLC Preferences > Hotkeys (ordinary VLC hotkeys, not global hotkeys), save and
-restart VLC if required. Then set `VOLUME_MODE = "keyboard"` in `config.py`.
-Change `KEYS` if you prefer different single-key bindings. Native Ctrl+Up/Down
-are not used by the existing configurable volume fallback.
+### Chapter/video return-to-neutral
 
-## Manual check
-
-While active, a diagnostic summary appears every five seconds with cumulative
-processed frames and hand-containing frames since camera activation, the current
-gesture and the confirmation/movement/release state. No frame-by-frame logging.
-
-For a visual check independent of VLC foreground status, run in this folder:
-
-```powershell
-.\.venv\Scripts\python.exe main.py --debug-preview
+```text
+CONFIRMING → ARMED → command → RETURNING → stable neutral → ARMED
 ```
 
-Preview shows landmarks, current gesture and confirmation state. All VLC commands
-are disabled in this mode. Press Q or Esc, close the preview, or use Ctrl+C to stop.
-MediaPipe warnings are left unchanged; these diagnostics help establish where
-detection or recognition is stopping before changing thresholds.
+- The starting neutral reference and palm scale stay fixed for the gesture.
+- Movement begun during pose confirmation is retained, including the video arm sweep.
+- Horizontal displacement must dominate vertical displacement by a factor of 1.2; curved paths are allowed.
+- RETURNING never emits reverse commands. Holding the far endpoint does not repeat the action.
+- Rearming requires 0.18 seconds near neutral at no more than 0.45 palm widths/second. Neutral zones are 0.08 palms for chapters and 0.22 for videos.
+- Pose release/change establishes a new reference on reconfirmation. RETURNING survives missing identity so recovery cannot turn return travel into a reverse command.
+- A large recovery jump can enter RETURNING **without a navigation command**. This is intentional protection, now explicitly logged; a later rearming message is not evidence of an unlogged command.
 
-1. Start Run-Test.bat; with another app focused, confirm inactive status and camera off.
-2. Focus VLC playing a video; confirm active/camera initialized messages.
-3. Check single-index up/down and release. Check continuous seeking, immediate direction
-   changes and no seeking while stationary. Check one play/pause per held palm;
-   release to neutral between toggles.
-4. Repeat in VLC fullscreen. Alt+Tab during a gesture; confirm webcam release,
-   no other app receives input, and fresh gesture baselines on returning to VLC.
-5. Try keyboard volume fallback if wheel messages are ignored. Check log entries,
-   then Ctrl+C and confirm camera release/shutdown.
+## VLC command delivery
 
-Written code was reviewed without execution. No dependencies were installed and
-no automated tests or physical gesture tests were run. Camera drivers can ignore
-requested resolution/FPS or block during capture; focus loss is checked between
-capture/inference operations, so hardware release cannot be instantaneous during
-a blocking driver call. Volume wheel messages are targeted; keyboard events use
-foreground-guarded SendInput, with the focus-race limitation explained above. The
-pointer is not moved. Differing privilege levels can block delivery. Input is logged as accepted/queued,
-not proof VLC acted on it. Use the same normal privilege level for VLC/controller.
-Gesture sensitivity, hardware performance and playback delivery need your manual
-validation. Stop after a capture or control error, inspect the log, then relaunch.
+| Action                       | Delivery                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| Play/pause                   | Space                                                                     |
+| Small seek                   | Shift + Left/Right; intended VLC very-short jump length is 3 seconds.     |
+| Chapter previous/next        | Shift + P/N                                                               |
+| Playlist video previous/next | P/N                                                                       |
+| Volume                       | Targeted wheel message by default; VLC determines the volume increment.   |
+| Optional keyboard fallbacks  | U/D for volume, J/L for seeking, requiring matching ordinary VLC hotkeys. |
 
-MediaPipe's upstream package documents performance/utilization metrics collection;
-the controller itself makes no network requests and requires no online service.
-If strict zero outbound traffic is required, block the project's Python executable
-with Windows Firewall during operation; local inference does not need network access.
+Keyboard dispatch uses one ordered `SendInput` batch. Modified shortcuts include Shift-down, key-down, key-up and Shift-up. Win32 input structures include the complete union and pointer-sized fields for correct layout.
+
+- Foreground VLC is checked immediately before dispatch. Keyboard input is not HWND-targeted, so a focus change during delivery remains possible.
+- Physical target keys/modifiers already held by the user suppress keyboard injection. The current caller resets activation after suppressed delivery.
+- Partial acceptance attempts key-up cleanup for accepted keydowns and logs failures.
+- Wheel messages target VLC's HWND and do not move the physical cursor.
+- Logs prove Windows acceptance/queueing, not VLC execution. Compare commands against playback during manual verification.
+- VLC/controller privilege levels must match; preferences are never changed automatically.
+
+## Process lifecycle and logging
+
+### Startup and shutdown
+
+1. Create timestamped file logging; add console output only when stdout exists.
+2. Acquire a Windows named mutex before heavy imports or webcam initialization. Its name is scoped to the resolved project path and login session.
+3. Reject duplicate launches without affecting the active controller. PID and instance-lock acquisition are logged.
+4. Stop signals a named event and waits up to 10 seconds for the completion event. It uses neither PID files nor broad Python process termination.
+5. Shutdown releases capture/model resources, flushes logs, signals completion and closes Windows handles. A crash lets Windows close the instance handle.
+
+The capture worker owns release: shutdown requests stop and joins it. A blocked driver read can delay cleanup beyond the initial join timeout; the controller waits instead of releasing the camera concurrently with a read.
+
+### Diagnostics and retention
+
+- Every five seconds while processing: frame/hand counts, activation, recognized gesture, movement state and thresholds.
+- Performance: actual capture/result FPS, capture/inference durations, replaced frames, stale/invalidated results and approximate capture-to-result latency.
+- Threaded capture FPS is measured separately; single-mode capture delivery is constrained by processing.
+- Latency starts at camera-read completion, not sensor exposure. Driver buffering can remain even when a one-frame buffer is requested.
+- Startup removes correctly named controller logs older than 30 days by filename timestamp. Cleanup checks direct containment, skips links/reparse points and redirected folders, never recurses, and logs deletion failures.
+
+## Known limits and review follow-ups
+
+| Area                 | Limit / consideration                                                                                                                                       |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tracking             | Depth changes and hand rotation affect 2D motion measurements; model identity errors cannot be ruled out.                                                   |
+| Identity acquisition | Initial confirmation can span a brief detection gap. Tightening it was deferred to avoid changing working acquisition responsiveness without manual checks. |
+| Focus                | `SendInput` has a small foreground-change race despite the immediate check.                                                                                 |
+| Physical keyboard    | Suppressed input currently resets activation; changing this needs gesture-state regression checks.                                                          |
+| Camera shutdown      | Driver reads may block, delaying release and completion signalling.                                                                                         |
+| MediaPipe warnings   | Feedback/NORM_RECT warnings are retained when harmless; diagnose actual detection/recognition failures with preview.                                        |
+| Network              | The controller makes no runtime network requests. Third-party package telemetry behavior is separate; local inference needs no online service.              |
+
+Manual testing reported approximately **30 capture FPS, 26 inference FPS and 39 ms capture-to-result latency** on the original system. These are observations, not guaranteed throughput on other hardware.
+
+## Manual verification checklist
+
+- [ ] Preview: verify anatomical Left/Right labels with each hand separately; confirm all VLC commands are disabled.
+- [ ] Activation: right hand alone does nothing; left-index HOLD works; brief uncertainty pauses safely.
+- [ ] Toggle: both-hand Shaka toggles once while held, blocks playback until both release, and plays the expected cues.
+- [ ] Focus: Alt+Tab resets activation and releases capture; returning starts disabled with fresh baselines. Repeat in fullscreen.
+- [ ] Volume/seek: check sensitivity, direction changes, release and no repetition while stationary; verify one seek increment is 3 seconds.
+- [ ] Chapter/video: check one action per outward movement, no reverse action on return, stable-neutral rearming and recovery after occlusion.
+- [ ] Play/pause: one command per deliberate palm; neutral release permits the next command.
+- [ ] Keyboard: compare shortcut logs with VLC actions, including physical held-key suppression and configured fallbacks.
+- [ ] Lifecycle: duplicate launches from every launcher are rejected; Stop releases resources; console Ctrl+C works; hidden mode still logs.
+- [ ] Logs: inspect FPS/latency diagnostics and retention behavior using disposable old timestamped logs inside the real logs folder.
+
+No automated or runtime validation was performed during the documentation update. Use the checklist for hardware and playback verification.
