@@ -19,8 +19,8 @@
 | [Stop.bat](Stop.bat)                     | Runs the lightweight stop helper using the local environment.                                                                                          |
 | [requirements.txt](requirements.txt)     | MediaPipe/OpenCV dependency constraints.                                                                                                               |
 | [.gitignore](.gitignore)                 | Excludes the environment, Python caches, logs, model files and incomplete model downloads.                                                             |
-| [README.md](README.md)                   | User-facing setup, controls and troubleshooting.                                                                                                       |
-| `DEVELOPMENT_NOTES.md`                   | Implementation reference and manual-verification checklist.                                                                                            |
+| [Readme.md](Readme.md)                   | User-facing setup, controls and troubleshooting.                                                                                                       |
+| `Development_Notes.md`                   | Implementation reference and manual-verification checklist.                                                                                            |
 
 These notes describe the current implementation. Configuration defaults are defined in `config.py`; everyday instructions belong in the README.
 
